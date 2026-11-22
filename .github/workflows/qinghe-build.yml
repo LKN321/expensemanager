@@ -30,8 +30,17 @@ jobs:
         uses: android-actions/setup-android@v4
 
       - name: Install Android SDK API 37
+        shell: bash
         run: |
-          sdkmanager --install "platforms;android-37" "build-tools;36.0.0"
+          set -euo pipefail
+          # Android 17 API 37 is distributed as android-37.0, not android-37.
+          sdkmanager --channel=3 --install "platforms;android-37.0" "build-tools;36.0.0"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$SDK_ROOT" || { echo "Android SDK root not set"; exit 1; }
+          # Some Android Gradle Plugin versions still look up the unversioned directory.
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
+            ln -s "$SDK_ROOT/platforms/android-37.0" "$SDK_ROOT/platforms/android-37"
+          fi
           sdkmanager --list_installed
 
       - name: Set up Gradle
