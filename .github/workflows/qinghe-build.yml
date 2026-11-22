@@ -1,0 +1,149 @@
+name: Qinghe Personal APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build signed APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Pin source to upstream release 1.4.32
+        run: |
+          git fetch --depth=1 https://github.com/nkuppan/expensemanager.git refs/tags/1.4.32
+          git -c advice.detachedHead=false checkout --detach FETCH_HEAD
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK API 37
+        run: |
+          sdkmanager --install "platforms;android-37" "build-tools;36.0.0"
+          sdkmanager --list_installed
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Apply Qinghe v0.1 branding (no database changes)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          gradle_file = Path("app/build.gradle.kts")
+          gradle_text = gradle_file.read_text(encoding="utf-8")
+          original = 'applicationId = "com.naveenapps.expensemanager"'
+          assert original in gradle_text, "Upstream applicationId changed; stop rather than patch incorrectly."
+          gradle_text = gradle_text.replace(
+              original, 'applicationId = "com.qinghe.personalbook"', 1
+          )
+          gradle_file.write_text(gradle_text, encoding="utf-8")
+
+          # Rename launcher label in base strings and every locale that defines it.
+          updated = 0
+          for strings in Path("app/src/main/res").glob("values*/strings.xml"):
+              source = strings.read_text(encoding="utf-8")
+              pattern = r'(<string\s+name="app_name"[^>]*>)(.*?)(</string>)'
+              changed, count = re.subn(
+                  pattern,
+                  lambda m: m.group(1) + "青禾记账" + m.group(3),
+                  source, count=1, flags=re.DOTALL,
+              )
+              if count:
+                  strings.write_text(changed, encoding="utf-8")
+                  updated += 1
+          assert updated, "The app_name resource was not found."
+
+          # Disable analytics and crash-report collection in the personal build.
+          manifest = Path("app/src/main/AndroidManifest.xml")
+          src = manifest.read_text(encoding="utf-8")
+          app_open = re.search(r'<application\b[^>]*>', src, flags=re.DOTALL)
+          assert app_open, "Application tag missing"
+          metadata = """
+              <meta-data android:name="firebase_analytics_collection_enabled"
+                         android:value="false" />
+              <meta-data android:name="firebase_crashlytics_collection_enabled"
+                         android:value="false" />
+          """
+          src = src[:app_open.end()] + metadata + src[app_open.end():]
+          manifest.write_text(src, encoding="utf-8")
+
+          # Google Services plugin requires build-time config. These are inert
+          # placeholder IDs, NOT a real Firebase account or cloud sync.
+          dummy_config = {
+            "project_info": {
+              "project_number": "123456789012",
+              "project_id": "qinghe-local-only-placeholder",
+              "storage_bucket": "qinghe-local-only-placeholder.appspot.com"
+            },
+            "client": [{
+              "client_info": {
+                "mobilesdk_app_id": "1:123456789012:android:abcdef0123456789",
+                "android_client_info": {"package_name": "com.qinghe.personalbook"}
+              },
+              "api_key": [{"current_key": "AIzaSyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}],
+              "services": {"appinvite_service": {"other_platform_oauth_client": []}}
+            }],
+            "configuration_version": "1"
+          }
+          Path("app/google-services.json").write_text(
+              json.dumps(dummy_config, ensure_ascii=False, indent=2),
+              encoding="utf-8"
+          )
+          print(f"Customized launcher label in {updated} locale file(s).")
+          PY
+
+      - name: Restore private signing key from GitHub Secrets
+        shell: bash
+        env:
+          QINGHE_KEYSTORE_BASE64: ${{ secrets.QINGHE_KEYSTORE_BASE64 }}
+          QINGHE_KEYSTORE_PASSWORD: ${{ secrets.QINGHE_KEYSTORE_PASSWORD }}
+        run: |
+          test -n "$QINGHE_KEYSTORE_BASE64" || { echo "Missing QINGHE_KEYSTORE_BASE64 secret"; exit 1; }
+          test -n "$QINGHE_KEYSTORE_PASSWORD" || { echo "Missing QINGHE_KEYSTORE_PASSWORD secret"; exit 1; }
+          mkdir -p keys
+          printf '%s' "$QINGHE_KEYSTORE_BASE64" | base64 --decode > keys/android_keystore.jks
+          cat > keys/credentials.properties <<EOF
+          KEY_ALIAS=qinghe
+          KEY_STORE_PASSWORD=$QINGHE_KEYSTORE_PASSWORD
+          KEY_PASSWORD=$QINGHE_KEYSTORE_PASSWORD
+          EOF
+          keytool -list -keystore keys/android_keystore.jks \
+            -storepass "$QINGHE_KEYSTORE_PASSWORD" -alias qinghe > /dev/null
+          chmod 600 keys/android_keystore.jks keys/credentials.properties
+
+      - name: Build signed release APK
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify output exists and record hash
+        shell: bash
+        run: |
+          find app/build/outputs/apk/release -name '*.apk' -type f -print
+          APK=$(find app/build/outputs/apk/release -name '*.apk' -type f | head -n 1)
+          test -n "$APK" && test -s "$APK"
+          sha256sum "$APK"
+
+      - name: Save installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: qinghe-v0.1-signed-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
